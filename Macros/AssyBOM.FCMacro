@@ -1,1 +1,235 @@
+import FreeCAD as App
+import Spreadsheet
+import re
+from collections import defaultdict
 
+doc = App.ActiveDocument
+
+# ==========================================
+# 1. 名前の正規化
+# ==========================================
+def normalize(name):
+    if not name or not isinstance(name, str): return ""
+    name = name.strip()
+    name = re.sub(r'-0\d{2}\s*$', '', name)
+    name = re.sub(r'(?<=[A-Za-z_])0\d{2}\s*$', '', name)
+    return name.strip()
+
+# ==========================================
+# 2. 単一部品（殻を割らないパーツ）の判定
+# ==========================================
+def is_leaf_part(name, obj=None):
+    if not name: return False
+    name_lower = name.lower()
+
+    if "set" in name_lower or "assy" in name_lower:
+        return False
+    
+    #部品があるのに弾かれた場合ここに例外処理を入れる
+    leaf_keywords = [
+        "bolt", "screw", "nut", "washer", "hntap", "ねじ", "ボルト", "ナット", "ワッシャー",
+        "nefs", "hblfs", "フレーム", "ベース", "ブラケット", "cmgj", "キャスター", "caster"
+    ]
+    if any(k in name_lower for k in leaf_keywords):
+        return True
+    if re.search(r'\bm\d+', name_lower):
+        return True
+
+    if obj:
+        if obj.isDerivedFrom("Part::Feature") or obj.isDerivedFrom("PartDesign::Body") or obj.isDerivedFrom("Mesh::Feature"):
+            return True
+        if obj.isDerivedFrom("App::Part") or obj.isDerivedFrom("App::Link") or obj.isDerivedFrom("App::LinkGroup"):
+            raw_children = []
+            if hasattr(obj, "Group"): raw_children.extend(obj.Group)
+            if hasattr(obj, "OutList"): raw_children.extend(obj.OutList)
+            if obj.isDerivedFrom("App::Link"):
+                try:
+                    linked = obj.getLinkedObject(True)
+                    if linked:
+                        if hasattr(linked, "Group"): raw_children.extend(linked.Group)
+                        if hasattr(linked, "OutList"): raw_children.extend(linked.OutList)
+                        if hasattr(linked, "Objects"): raw_children.extend([o for o in linked.Objects if not o.InList])
+                except: pass
+            has_sub_assy = False
+            for c in raw_children:
+                if c and (c.isDerivedFrom("App::Part") or c.isDerivedFrom("App::Link") or c.isDerivedFrom("App::LinkGroup") or c.TypeId == "App::DocumentObjectGroup"):
+                    has_sub_assy = True
+                    break
+            if not has_sub_assy:
+                return True
+    return False
+
+# ==========================================
+# 3. BOMへの関係追加
+# ==========================================
+bom = defaultdict(int)
+
+def add_relation(parent, child):
+    p = normalize(parent)
+    c = normalize(child)
+    if p and c and p != c:
+        bom[(p, c)] += 1
+
+# ==========================================
+# 4. オブジェクトの中身を安全に取得する関数
+# ==========================================
+def get_raw_children(obj):
+    raw_children = []
+    if not obj: return raw_children
+    if hasattr(obj, "Group"):
+        raw_children.extend(obj.Group)
+    if obj.isDerivedFrom("App::LinkGroup") and hasattr(obj, "OutList"):
+        raw_children.extend(obj.OutList)
+    if obj.isDerivedFrom("App::Link"):
+        try:
+            linked = obj.getLinkedObject(True)
+            if linked:
+                if hasattr(linked, "Group"):
+                    raw_children.extend(linked.Group)
+                if linked.isDerivedFrom("App::LinkGroup") and hasattr(linked, "OutList"):
+                    raw_children.extend(linked.OutList)
+                if hasattr(linked, "Objects"):
+                    raw_children.extend([o for o in linked.Objects if not o.InList])
+        except: pass
+    
+    seen = set()
+    unique = []
+    for c in raw_children:
+        if c and c.Name not in seen:
+            seen.add(c.Name)
+            unique.append(c)
+    return unique
+
+# ==========================================
+# 5. 除外するパーツの判定（例外リスト）
+# ==========================================
+def is_ignored_part(name, obj=None):
+    if not name: return True
+    name_lower = name.lower()
+    ignore_keywords = [
+        "pad", "hole", "pocket", "body", "sketch", 
+        "basefeature", "chamfer", "fillet", "原点"
+    ]
+    if any(k in name_lower for k in ignore_keywords):
+        return True
+    if obj:
+        ignore_types = [
+            "App::Origin", "App::Line", "App::Plane", "App::Point", 
+            "PartDesign::CoordinateSystem"
+        ]
+        if obj.TypeId in ignore_types:
+            return True
+    return False
+
+# ==========================================
+# 6. 殻を割り続け、中身だけを最上位の親に合算する再帰関数
+# ==========================================
+def collect_parts(current_obj, top_parent_name):
+    if not current_obj or not hasattr(current_obj, "Label"): return
+
+    child_name = normalize(current_obj.Label)
+    if not child_name: return
+
+    if is_ignored_part(child_name, current_obj):
+        return
+
+    if is_leaf_part(child_name, current_obj):
+        add_relation(top_parent_name, child_name)
+        return
+
+    is_container = current_obj.isDerivedFrom("App::Part") or \
+                   current_obj.isDerivedFrom("App::Link") or \
+                   current_obj.isDerivedFrom("App::LinkGroup") or \
+                   current_obj.TypeId == "App::DocumentObjectGroup"
+
+    if is_container:
+        raw_children = get_raw_children(current_obj)
+        for child in raw_children:
+            collect_parts(child, top_parent_name)
+    else:
+        add_relation(top_parent_name, child_name)
+
+# ==========================================
+# 7. ツリーの最上位にある「本物の親」だけを探す関数
+# ==========================================
+def find_top_level_assemblies(obj):
+    assemblies = []
+    if not obj: return assemblies
+    if obj.TypeId == "App::DocumentObjectGroup":
+        for child in get_raw_children(obj):
+            assemblies.extend(find_top_level_assemblies(child))
+    elif obj.isDerivedFrom("App::Part") or obj.isDerivedFrom("App::Link") or obj.isDerivedFrom("App::LinkGroup"):
+        assemblies.append(obj)
+    return assemblies
+
+# ==========================================
+# メイン処理 (データ抽出とシート作成)
+# ==========================================
+bom.clear()
+processed_assemblies = set()
+
+# トップレベルのアセンブリを取得
+top_assemblies = []
+for obj in doc.Objects:
+    if obj.InList: continue 
+    top_assemblies.extend(find_top_level_assemblies(obj))
+
+top_counts = defaultdict(int)
+
+# 展開処理
+for assy in top_assemblies:
+    top_parent_name = normalize(assy.Label)
+    if not top_parent_name: continue
+    
+    # トップレベルの数量をカウント（BOM出力用）
+    top_counts[top_parent_name] += 1
+    
+    if top_parent_name in processed_assemblies:
+        continue
+    processed_assemblies.add(top_parent_name)
+    
+    children = get_raw_children(assy)
+    for child in children:
+        collect_parts(child, top_parent_name)
+
+# ==========================================
+# 8. スプレッドシートへの書き出し処理
+# ==========================================
+# 既存のシートがあれば取得し、なければ新規作成
+sheet_bom = doc.getObject("BOM")
+if not sheet_bom:
+    sheet_bom = doc.addObject("Spreadsheet::Sheet", "BOM")
+
+sheet_assy = doc.getObject("BOM_Assy")
+if not sheet_assy:
+    sheet_assy = doc.addObject("Spreadsheet::Sheet", "BOM_Assy")
+
+# シートの初期化とヘッダー作成
+sheet_bom.clearAll()
+sheet_bom.set("A1", "部品名称")
+sheet_bom.set("B1", "数量")
+sheet_bom.setStyle("A1:B1", "bold", "add")
+
+sheet_assy.clearAll()
+sheet_assy.set("A1", "アセンブリ名称")
+sheet_assy.set("B1", "部品名称")
+sheet_assy.set("C1", "数量")
+sheet_assy.setStyle("A1:C1", "bold", "add")
+
+# BOM (トップレベルリスト) の書き込み
+row = 2
+for name, qty in top_counts.items():
+    sheet_bom.set("A" + str(row), name)
+    sheet_bom.set("B" + str(row), str(qty))
+    row += 1
+
+# BOM_Assy (アセンブリ構成リスト) の書き込み
+row = 2
+for (parent, child), qty in bom.items():
+    sheet_assy.set("A" + str(row), parent)
+    sheet_assy.set("B" + str(row), child)
+    sheet_assy.set("C" + str(row), str(qty))
+    row += 1
+
+doc.recompute()
+App.Console.PrintMessage("マクロ1号: BOM および BOM_Assy の出力が完了しました！\n")
