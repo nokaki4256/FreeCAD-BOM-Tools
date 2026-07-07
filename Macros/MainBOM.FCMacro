@@ -1,1 +1,186 @@
+import FreeCAD as App
+import Spreadsheet
+import csv
+import os
+import re
+from collections import Counter
 
+doc = App.ActiveDocument
+parts = Counter()
+visited = set()
+
+
+#
+# 名前の正規化
+#
+
+#引数nameでマッチするものを検索してマッチしたら返す
+def normalize(name):
+    if not name:
+        return ""
+        
+    # 末尾の -000 などを消す
+    m = re.match(r'^(.*)-\d{3}$', name)
+    if m:
+        return m.group(1)
+        
+    # マッチしなかった場合は、元の名前をそのまま返す！
+    return name
+
+
+#
+# オブジェクトを再帰的に取得
+#
+visited = set()
+
+def walk(obj):
+
+    key = (obj.Document.Name,obj.Name)
+
+    if key in visited:
+        return
+
+    visited.add(key)
+
+    yield obj
+
+    #
+    # DocumentObjectGroup
+    #
+    if obj.isDerivedFrom("App::DocumentObjectGroup"):
+
+        try:
+            for child in obj.Group:
+
+                for x in walk(child):
+                    yield x
+        except:
+            pass
+
+    #
+    # App::Part
+    #
+    elif hasattr(obj, "Group"):
+
+        try:
+            for child in obj.Group:
+
+                for x in walk(child):
+                    yield x
+        except:
+            pass
+
+    #
+    # その他の子
+    #
+    try:
+        for child in obj.OutList:
+
+            for x in walk(child):
+                yield x
+    except:
+        pass
+#
+# 部品集計
+#
+
+visited.clear()
+
+old_obj = ""
+old_linked = ""
+
+for root in doc.Objects:
+    # 💡 親オブジェクトが「アセンブリ（App::Part）」の場合は、中身（子パーツ）なのでスキップする
+    # ※ グループ（App::DocumentObjectGroup）の子パーツは、ここではスキップされず集計対象になります
+    is_inside_assembly = False
+    for parent in root.InList:
+        if parent.isDerivedFrom("App::Part"):
+            is_inside_assembly = True
+            break
+            
+    if is_inside_assembly:
+        continue
+    obj = root
+
+    #
+    # Fasteners (または標準の App::Part など、アセンブリ単位で集計したい場合)
+    #
+    if obj and (obj.isDerivedFrom("Part::FeaturePython") or obj.isDerivedFrom("App::Part")):
+        name = normalize(obj.Label)
+        if name: # normalizeの結果がNoneでなければ
+            parts[name] += 1
+        continue
+
+    #
+    # App::Link （外部参照リンクなど）
+    #
+    if obj and obj.isDerivedFrom("App::Link"):
+        try:
+            linked = obj.getLinkedObject(True)
+            if linked is None:
+                continue
+                
+            # 🔴 リンク先が「アセンブリ(App::Part)」であっても、その中の子パーツは見ず、
+            # リンクオブジェクトそのものの名前、あるいはリンク先の親の名前で集計する
+            name = normalize(linked.Label)
+            if name:
+                parts[name] += 1
+        except:
+            pass
+
+#
+# 既存BOM削除
+#
+try:
+    doc.removeObject("BOM")
+except:
+    pass
+
+
+#
+# Spreadsheet作成
+#
+sheet = doc.addObject("Spreadsheet::Sheet","BOM")
+
+sheet.set("A1","Part")
+
+sheet.set("B1","Qty")
+
+row = 2
+
+#nameが空になる
+for name, qty in sorted(parts.items(), key=lambda x: x[0] if x[0] is not None else ""):
+#for name, qty in sorted(parts.items()):
+
+    #sheet.set("A" + str(row),name)
+    sheet.set("A" + str(row), name or "")
+    sheet.set("B" + str(row),str(qty))
+
+    row += 1
+
+doc.recompute()
+
+
+#
+# CSV出力
+#
+if doc.FileName:
+
+    folder = os.path.dirname(doc.FileName)
+
+    csv_path = os.path.join(folder,"BOM.csv")
+
+    with open(csv_path,"w",newline="",encoding="utf-8-sig") as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(["Part","Qty"])
+        
+        for name, qty in sorted(parts.items(), key=lambda x: x[0] if x[0] is not None else ""):
+        #for name, qty in sorted(parts.items()):
+
+            writer.writerow([name,qty])
+
+App.Console.PrintMessage(
+    "BOM作成完了\n"
+)
