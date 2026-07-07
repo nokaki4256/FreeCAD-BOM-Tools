@@ -1,1 +1,47 @@
+import FreeCAD as App
+import os
 
+# ==========================================
+# 1. マクロが保存されているフォルダのパスを自動取得
+# ==========================================
+macro_dir = App.getUserMacroDir(True)
+
+# ==========================================
+# 2. 順番に実行したいマクロのファイル名をリスト化
+# ==========================================
+# 🔴 注意：実際のファイル名（.FCMacro まで）と完全に一致させてください。
+# 過去のエラーメッセージから抽出・統合マクロの名前を推測して入れています。
+macros_to_run = [
+    "メイン部品表リスト作成.FCMacro",         # ① メインマクロ（※ここをご自身のファイル名に書き換えてください）
+    "サブアセンブリ部品表リスト作成.FCMacro",   # ② 抽出マクロ（マクロ1号）
+    "部品表統合マクロ.FCMacro"                  # ③ 統合マクロ（マクロ2号）
+]
+
+# ==========================================
+# 3. 順番に読み込んで実行する処理
+# ==========================================
+App.Console.PrintMessage("=== 連続処理を開始します ===\n")
+
+for macro_name in macros_to_run:
+    macro_path = os.path.join(macro_dir, macro_name)
+    
+    # ファイルが存在するかチェック
+    if os.path.exists(macro_path):
+        App.Console.PrintMessage(f"▶ 実行中: {macro_name} ...\n")
+        try:
+            # ファイルを開いて実行。
+            # {} を渡すことで、マクロ間で変数（rowやdocなど）が混ざるのを防ぐ安全設計です。
+            with open(macro_path, "r", encoding="utf-8") as f:
+                exec(f.read(), {})
+            App.Console.PrintMessage(f"✔ 完了: {macro_name}\n")
+        except Exception as e:
+            # エラーが起きた場合は安全のために後続のマクロをストップする
+            App.Console.PrintError(f"✖ エラー発生 ({macro_name}): {e}\n")
+            App.Console.PrintError("処理を中断しました。\n")
+            break 
+    else:
+        App.Console.PrintError(f"✖ ファイルが見つかりません: {macro_name}\n")
+        App.Console.PrintError("処理を中断しました。ファイル名を確認してください。\n")
+        break 
+
+App.Console.PrintMessage("=== すべての処理が完了しました！ ===\n")
