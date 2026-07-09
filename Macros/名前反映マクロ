@@ -1,0 +1,4 @@
+import FreeCAD as App
+for obj in App.ActiveDocument.Objects:
+    if obj.isDerivedFrom("App::Link") and obj.LinkedObject:
+        obj.Label = obj.LinkedObject.Label
