@@ -72,52 +72,109 @@ else:
 # ==========================================
     # 4. 統合版リストの計算処理
     # ==========================================
-    # 最終的な部品と総数量を格納する辞書（同じ部品が複数回出てきたら合算します）
+    import re
+
+    # 最終的な部品データを格納する辞書
+    # 構造: final_bom["ベース部品名"] = {"qty": 総数量, "maker": "メーカー名"}
     final_bom = {}
 
+    def add_to_final(raw_name, add_qty):
+        # カッコ内のメーカー名と、カッコを除外したベース部品名に分割
+        match = re.search(r'[(（](.*?)[)）]', raw_name)
+        if match:
+            maker = match.group(1).strip()
+            base_name = re.sub(r'[(（].*?[)）]', '', raw_name).strip()
+        else:
+            maker = ""
+            base_name = raw_name.strip()
+
+        # 初めて登場するベース部品名なら辞書に登録
+        if base_name not in final_bom:
+            final_bom[base_name] = {"qty": 0, "maker": ""}
+        
+        # 数量を合算
+        final_bom[base_name]["qty"] += add_qty
+        
+        # メーカー名がまだ空欄で、今回の名前にメーカー名が含まれていれば上書き記録
+        if final_bom[base_name]["maker"] == "" and maker != "":
+            final_bom[base_name]["maker"] = maker
+
     for part, qty in bom_list:
+        # アセンブリ展開用のベース名（親アセンブリ名にカッコが付いていた場合の保険）
+        part_base = re.sub(r'[(（].*?[)）]', '', part).strip()
+        
         # パターンB: アセンブリ（BOM_AssyのA列に名前が存在する）場合
         if part in assy_dict:
-            # BOM_Assyに登録されている構成部品をすべて展開して掛け算
             for child_name, child_qty in assy_dict[part]:
-                total_qty = qty * child_qty
+                add_to_final(child_name, qty * child_qty)
+        elif part_base in assy_dict:
+            for child_name, child_qty in assy_dict[part_base]:
+                add_to_final(child_name, qty * child_qty)
                 
-                # 統合版リストに追加（既に同じ部品があれば足し算）
-                if child_name in final_bom:
-                    final_bom[child_name] += total_qty
-                else:
-                    final_bom[child_name] = total_qty
-                    
         # パターンA: 単独の部品（BOM_Assyに存在しない）場合
         else:
-            # そのままの数量で統合版リストに追加
-            if part in final_bom:
-                final_bom[part] += qty
-            else:
-                final_bom[part] = qty
+            add_to_final(part, qty)
 
+    # 既存BOM削除
+    try:
+        doc.removeObject("BOM_Total")
+    except:
+        pass
+
+# ==========================================
+    # 5. 新しいスプレッドシートとCSVへの出力
     # ==========================================
-    # 5. 新しいスプレッドシートへの出力
-    # ==========================================
-    # 新しいスプレッドシートの作成
-    # 実行するたびに上書きされないよう、ユニークな名前を付けます
     import time
+    import os
+    import csv
+
     timestamp = time.strftime("%H%M%S")
-    sheet_name = "BOM_Total_" + timestamp
+    sheet_name = "BOM_Total"
     new_sheet = doc.addObject("Spreadsheet::Sheet", sheet_name)
 
     # ヘッダーの書き込み
     new_sheet.set("A1", "部品名称")
-    new_sheet.set("B1", "総数量")
-    new_sheet.setStyle("A1:B1", "bold", "add")
+    new_sheet.set("B1", "メーカー名")
+    new_sheet.set("C1", "総数量")
+    new_sheet.setStyle("A1:C1", "bold", "add")
 
-    # データの書き込み（2行目からスタート）
+    # データをソート（メーカー名昇順 → 部品名昇順）
+    sorted_bom = sorted(final_bom.items(), key=lambda item: (item[1]["maker"], item[0]))
+
+    # CSV出力用のファイルパスを設定（FreeCADファイルと同じ場所に保存）
+    # ※ファイルが未保存の場合は、マクロの実行フォルダに保存されます
+    doc_filename = doc.FileName
+    if doc_filename:
+        export_dir = os.path.dirname(doc_filename)
+    else:
+        export_dir = App.getUserMacroDir(True)
+    
+    csv_path = os.path.join(export_dir, f"BOM_Total_{timestamp}.csv")
+
+    # データの書き込み
     row = 2
-    for name, total in final_bom.items():
-        new_sheet.set("A" + str(row), name)
-        new_sheet.set("B" + str(row), str(total))
+    csv_data = [["部品名称", "メーカー名", "総数量"]] # CSV用のヘッダー行
+
+    for base_name, data in sorted_bom:
+        # スプレッドシートへの書き込み
+        new_sheet.set("A" + str(row), base_name)
+        new_sheet.set("B" + str(row), data["maker"])
+        new_sheet.set("C" + str(row), str(data["qty"]))
         row += 1
+        
+        # CSV用のデータとして追加
+        csv_data.append([base_name, data["maker"], data["qty"]])
+
+    # CSVファイルの書き出し
+    # Excelで文字化けしないよう、BOM付きUTF-8 (utf-8-sig) で保存します
+    try:
+        with open(csv_path, mode="w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerows(csv_data)
+        csv_msg = f"\nCSVファイルも保存しました:\n{csv_path}"
+    except Exception as e:
+        csv_msg = f"\n※CSV保存エラー: {e}"
 
     # スプレッドシートの再計算と画面更新
     doc.recompute()
-    App.Console.PrintMessage(f"統合版リスト「{sheet_name}」の作成が完了しました。\n")
+    App.Console.PrintMessage(f"統合版リスト「{sheet_name}」の作成が完了しました。{csv_msg}\n")
